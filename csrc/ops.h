@@ -94,7 +94,10 @@ void swiglustep_and_mul(
     std::optional<torch::Tensor> valid_rows = std::nullopt);
 
 
-void gelu_tanh_and_mul(torch::Tensor& out, torch::Tensor& input);
+void gelu_tanh_and_mul(
+    torch::Tensor& out,
+    torch::Tensor& input,
+    std::optional<torch::Tensor> valid_rows = std::nullopt);
 
 void fatrelu_and_mul(
     torch::Tensor& out, torch::Tensor& input, double threshold);

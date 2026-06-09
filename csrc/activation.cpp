@@ -624,10 +624,10 @@ void gelu_and_mul(
 }
 
 void gelu_tanh_and_mul(
-    torch::Tensor& out,    // [..., d]
-    torch::Tensor& input)  // [..., 2 * d]
+    torch::Tensor& out,                       // [..., d]
+    torch::Tensor& input,                     // [..., 2 * d]
+    std::optional<torch::Tensor> valid_rows) // optional int64 scalar
 {
-  std::optional<torch::Tensor> valid_rows = std::nullopt;
   VLLM_DISPATCH_FLOATING_TYPES(input.scalar_type(), "gelu_tanh_and_mul", [&] {
     LAUNCH_ACTIVATION_GATE_KERNEL_VEC(vllm::gelu_tanh_kernel, true);
   });
