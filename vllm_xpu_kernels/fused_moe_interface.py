@@ -92,17 +92,22 @@ def compute_num_tokens_per_block(num_tokens, num_experts_per_node):
     return 1024
 
 
-def fused_moe_activation(act_output, gemm1_output, activation):
+def fused_moe_activation(act_output,
+                         gemm1_output,
+                         activation,
+                         valid_tokens=None):
     if activation == "silu":
-        torch.ops._C.silu_and_mul(act_output, gemm1_output)
+        torch.ops._C.silu_and_mul(act_output, gemm1_output, valid_tokens)
     elif activation == "gelu":
-        torch.ops._C.gelu_and_mul(act_output, gemm1_output)
+        torch.ops._C.gelu_and_mul(act_output, gemm1_output, valid_tokens)
     elif activation == "swigluoai" or ("SWIGLUOAI" in str(activation)):
-        torch.ops._C.swigluoai_and_mul(act_output, gemm1_output, 1.702, 7.0)
+        torch.ops._C.swigluoai_and_mul(act_output, gemm1_output,
+                                       1.702, 7.0, valid_tokens)
     elif activation == "relu2_no_mul":
-        torch.ops._C.relu2_no_mul(act_output, gemm1_output)
+        torch.ops._C.relu2_no_mul(act_output, gemm1_output, valid_tokens)
     elif activation == "swiglustep":
-        torch.ops._C.swiglustep_and_mul(act_output, gemm1_output, 7.0)
+        torch.ops._C.swiglustep_and_mul(act_output, gemm1_output,
+                                        7.0, valid_tokens)
     else:
         raise ValueError(f"Unsupported FusedMoe activation: {activation}.")
 
@@ -466,6 +471,9 @@ class XpuFusedMoe:
             total_experts_num=self.total_experts_num,
             local_experts_num=self.local_experts_num)
 
+        # Keep int64 to avoid overflow for large sequences and avoid host sync.
+        valid_tokens = rows_per_expert.sum(dtype=torch.int64).view(1)
+
         ########### gemm1 ##################
         gemm1_output = torch.empty((num_moe_inputs, 2 * self.inter_size),
                                 dtype=hidden_states.dtype,
@@ -483,12 +491,15 @@ class XpuFusedMoe:
             is_B_int4=self.is_int4,
             is_B_mxfp4=self.is_mxfp4)
 
-        # act
+        # act: pass valid_tokens to the shared kernel to skip invalid rows.
         act_output = torch.empty(
             (num_moe_inputs, self.inter_size * self.inter_size_scale),
             dtype=gemm1_output.dtype,
             device=gemm1_output.device)
-        self.act_func(act_output, gemm1_output)
+        fused_moe_activation(act_output,
+                             gemm1_output,
+                             self.activation,
+                             valid_tokens)
 
         ########### gemm2 ##################
         gemm2_output = torch.empty((num_moe_inputs, hidden_size),
@@ -655,6 +666,9 @@ def xpu_fused_moe(hidden_states,
         total_experts_num=total_experts_num,
         local_experts_num=local_experts_num)
 
+    # Keep int64 to avoid overflow for large sequences and avoid host sync.
+    valid_tokens = rows_per_expert.sum(dtype=torch.int64).view(1)
+
     ########### gemm1 ##################
     input_B = w13
 
@@ -672,11 +686,11 @@ def xpu_fused_moe(hidden_states,
         is_B_mxfp4=is_mxfp4)
 
     inter_size_scale = 2 if activation == "relu2_no_mul" else 1
-    # act
+    # act: pass valid_tokens to the shared kernel to skip invalid rows.
     act_output = torch.empty((num_moe_inputs, inter_size * inter_size_scale),
                              dtype=gemm1_output.dtype,
                              device=gemm1_output.device)
-    fused_moe_activation(act_output, gemm1_output, activation)
+    fused_moe_activation(act_output, gemm1_output, activation, valid_tokens)
 
     ########### gemm2 ##################
     input_A = act_output.contiguous()
