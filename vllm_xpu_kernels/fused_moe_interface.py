@@ -17,6 +17,7 @@ from ._mx_utils import (fp4_e2m1fn_x2_to_float, hp_from_1x128, hp_from_128x128,
                         quant_fp8_act, quant_mxfp_act)
 
 REF_FUSED_MOE_ENV = "VLLM_XPU_FUSED_MOE_USE_REF"
+DISABLE_BF16_FC1_SILU_FUSION_ENV = "VLLM_XPU_DISABLE_BF16_FC1_SILU_FUSION"
 
 
 def _is_env_enabled(env_name: str, default: str = "0") -> bool:
@@ -91,6 +92,15 @@ def compute_num_tokens_per_block(num_tokens, num_experts_per_node):
         if num_blocks_per_seq * num_experts_per_node <= num_tokens_per_block:
             return num_tokens_per_block
     return 1024
+
+
+def _can_use_bf16_fc1_silu_fusion(hidden_states, activation, is_fp8, is_int4,
+                                  is_mxfp4, is_mxfp8, is_block_fp8):
+    if _is_env_enabled(DISABLE_BF16_FC1_SILU_FUSION_ENV):
+        return False
+    return (hidden_states.dtype == torch.bfloat16 and activation == "silu"
+            and not is_fp8 and not is_int4 and not is_mxfp4
+            and not is_mxfp8 and not is_block_fp8)
 
 
 def fused_moe_activation(act_output,
@@ -475,6 +485,18 @@ class XpuFusedMoe:
         rows_per_expert = torch.zeros((self.num_experts),
                                                 dtype=torch.int32,
                                                 device=hidden_states.device)
+        active_expert_ids = torch.empty((self.num_experts, ),
+                        dtype=torch.int32,
+                        device=hidden_states.device)
+        active_row_offsets = torch.empty((self.num_experts, ),
+                         dtype=torch.int32,
+                         device=hidden_states.device)
+        active_expert_count = torch.empty((1, ),
+                          dtype=torch.int32,
+                          device=hidden_states.device)
+        valid_tokens = torch.empty((1, ),
+                                   dtype=torch.int64,
+                                   device=hidden_states.device)
         unpermuted_row_to_permuted_row = torch.empty(
             (num_rows, self.n_experts_per_token),
             dtype=torch.int32,
@@ -490,44 +512,63 @@ class XpuFusedMoe:
             unpermuted_row_to_permuted_row=unpermuted_row_to_permuted_row,
             topk_ids=topk_ids,
             total_experts_num=self.total_experts_num,
-            local_experts_num=self.local_experts_num)
+            local_experts_num=self.local_experts_num,
+            valid_tokens=valid_tokens,
+            active_expert_ids=active_expert_ids,
+            active_row_offsets=active_row_offsets,
+            active_expert_count=active_expert_count)
 
-        # Keep int64 to avoid overflow for large sequences and avoid host sync.
-        valid_tokens = rows_per_expert.sum(dtype=torch.int64).view(1)
-
-        ########### gemm1 ##################
-        gemm1_output = torch.empty((num_moe_inputs, 2 * self.inter_size),
-                                dtype=hidden_states.dtype,
-                                device=hidden_states.device)
-        torch.ops._xpu_C.cutlass_grouped_gemm_interface(
-            ptr_A=remapped_hidden_states,
-            ptr_B=self.w13,
-            ptr_scales=self.gemm1_scales,
-            ptr_bias=self.w13_bias,
-            ptr_D=gemm1_output,
-            rows_per_expert=rows_per_expert,
-            N=2 * self.inter_size,
-            K=hidden_size,
-            num_experts=self.num_experts,
-            is_B_int4=self.is_int4,
-            is_B_mxfp4=self.is_mxfp4)
-
-        # Apply swiglu_limit clamping before activation
-        if self.gemm1_clamp_limit is not None and self.gemm1_clamp_limit > 0:
-            gate = gemm1_output[:, :self.inter_size]
-            up = gemm1_output[:, self.inter_size:]
-            gate.clamp_(max=self.gemm1_clamp_limit)
-            up.clamp_(min=-self.gemm1_clamp_limit, max=self.gemm1_clamp_limit)
-
-        # act: pass valid_tokens to the shared kernel to skip invalid rows.
+        ########### gemm1 + act ##################
         act_output = torch.empty(
             (num_moe_inputs, self.inter_size * self.inter_size_scale),
-            dtype=gemm1_output.dtype,
-            device=gemm1_output.device)
-        fused_moe_activation(act_output,
-                             gemm1_output,
-                             self.activation,
-                             valid_tokens)
+            dtype=hidden_states.dtype,
+            device=hidden_states.device)
+        if _can_use_bf16_fc1_silu_fusion(hidden_states, self.activation,
+                                         self.is_fp8, self.is_int4,
+                                         self.is_mxfp4, self.is_mxfp8,
+                                         self.is_block_fp8):
+            torch.ops._xpu_C.cutlass_moe_fc1_silu_interface(
+                ptr_A=remapped_hidden_states,
+                ptr_B=self.w13,
+                ptr_bias=self.w13_bias,
+                ptr_D=act_output,
+                rows_per_expert=rows_per_expert,
+                active_expert_ids=active_expert_ids,
+                active_row_offsets=active_row_offsets,
+                active_expert_count=active_expert_count,
+                inter_size=self.inter_size,
+                K=hidden_size,
+                num_experts=self.num_experts,
+                clamp_limit=(self.gemm1_clamp_limit
+                             if self.gemm1_clamp_limit is not None else 0.0))
+        else:
+            gemm1_output = torch.empty((num_moe_inputs, 2 * self.inter_size),
+                                       dtype=hidden_states.dtype,
+                                       device=hidden_states.device)
+            torch.ops._xpu_C.cutlass_grouped_gemm_interface(
+                ptr_A=remapped_hidden_states,
+                ptr_B=self.w13,
+                ptr_scales=self.gemm1_scales,
+                ptr_bias=self.w13_bias,
+                ptr_D=gemm1_output,
+                rows_per_expert=rows_per_expert,
+                N=2 * self.inter_size,
+                K=hidden_size,
+                num_experts=self.num_experts,
+                is_B_int4=self.is_int4,
+                is_B_mxfp4=self.is_mxfp4)
+
+            if self.gemm1_clamp_limit is not None and self.gemm1_clamp_limit > 0:
+                gate = gemm1_output[:, :self.inter_size]
+                up = gemm1_output[:, self.inter_size:]
+                gate.clamp_(max=self.gemm1_clamp_limit)
+                up.clamp_(min=-self.gemm1_clamp_limit,
+                          max=self.gemm1_clamp_limit)
+
+            fused_moe_activation(act_output,
+                                 gemm1_output,
+                                 self.activation,
+                                 valid_tokens)
 
         ########### gemm2 ##################
         gemm2_output = torch.empty((num_moe_inputs, hidden_size),
@@ -679,6 +720,18 @@ def xpu_fused_moe(hidden_states,
     rows_per_expert = torch.zeros((num_experts),
                                             dtype=torch.int32,
                                             device=hidden_states.device)
+    active_expert_ids = torch.empty((num_experts, ),
+                                    dtype=torch.int32,
+                                    device=hidden_states.device)
+    active_row_offsets = torch.empty((num_experts, ),
+                                     dtype=torch.int32,
+                                     device=hidden_states.device)
+    active_expert_count = torch.empty((1, ),
+                                      dtype=torch.int32,
+                                      device=hidden_states.device)
+    valid_tokens = torch.empty((1, ),
+                               dtype=torch.int64,
+                               device=hidden_states.device)
     unpermuted_row_to_permuted_row = torch.empty(
         (num_rows, n_experts_per_token),
         dtype=torch.int32,
@@ -694,40 +747,56 @@ def xpu_fused_moe(hidden_states,
         unpermuted_row_to_permuted_row=unpermuted_row_to_permuted_row,
         topk_ids=topk_ids,
         total_experts_num=total_experts_num,
-        local_experts_num=local_experts_num)
-
-    # Keep int64 to avoid overflow for large sequences and avoid host sync.
-    valid_tokens = rows_per_expert.sum(dtype=torch.int64).view(1)
-
-    ########### gemm1 ##################
-    input_B = w13
-
-    torch.ops._xpu_C.cutlass_grouped_gemm_interface(
-        ptr_A=remapped_hidden_states,
-        ptr_B=input_B,
-        ptr_scales=gemm1_scales,
-        ptr_bias=w13_bias,
-        ptr_D=gemm1_output,
-        rows_per_expert=rows_per_expert,
-        N=2 * inter_size,
-        K=hidden_size,
-        num_experts=num_experts,
-        is_B_int4=is_int4,
-        is_B_mxfp4=is_mxfp4)
-
-    # Apply swiglu_limit clamping before activation
-    if gemm1_clamp_limit is not None and gemm1_clamp_limit > 0:
-        gate = gemm1_output[:, :inter_size]
-        up = gemm1_output[:, inter_size:]
-        gate.clamp_(max=gemm1_clamp_limit)
-        up.clamp_(min=-gemm1_clamp_limit, max=gemm1_clamp_limit)
+        local_experts_num=local_experts_num,
+        valid_tokens=valid_tokens,
+        active_expert_ids=active_expert_ids,
+        active_row_offsets=active_row_offsets,
+        active_expert_count=active_expert_count)
 
     inter_size_scale = 2 if activation == "relu2_no_mul" else 1
-    # act: pass valid_tokens to the shared kernel to skip invalid rows.
     act_output = torch.empty((num_moe_inputs, inter_size * inter_size_scale),
-                             dtype=gemm1_output.dtype,
-                             device=gemm1_output.device)
-    fused_moe_activation(act_output, gemm1_output, activation, valid_tokens)
+                             dtype=hidden_states.dtype,
+                             device=hidden_states.device)
+    if _can_use_bf16_fc1_silu_fusion(hidden_states, activation, is_fp8,
+                                     is_int4, is_mxfp4, is_mxfp8,
+                                     is_block_fp8):
+        torch.ops._xpu_C.cutlass_moe_fc1_silu_interface(
+            ptr_A=remapped_hidden_states,
+            ptr_B=w13,
+            ptr_bias=w13_bias,
+            ptr_D=act_output,
+            rows_per_expert=rows_per_expert,
+            active_expert_ids=active_expert_ids,
+            active_row_offsets=active_row_offsets,
+            active_expert_count=active_expert_count,
+            inter_size=inter_size,
+            K=hidden_size,
+            num_experts=num_experts,
+            clamp_limit=(gemm1_clamp_limit if gemm1_clamp_limit is not None
+                         else 0.0))
+    else:
+        input_B = w13
+
+        torch.ops._xpu_C.cutlass_grouped_gemm_interface(
+            ptr_A=remapped_hidden_states,
+            ptr_B=input_B,
+            ptr_scales=gemm1_scales,
+            ptr_bias=w13_bias,
+            ptr_D=gemm1_output,
+            rows_per_expert=rows_per_expert,
+            N=2 * inter_size,
+            K=hidden_size,
+            num_experts=num_experts,
+            is_B_int4=is_int4,
+            is_B_mxfp4=is_mxfp4)
+
+        if gemm1_clamp_limit is not None and gemm1_clamp_limit > 0:
+            gate = gemm1_output[:, :inter_size]
+            up = gemm1_output[:, inter_size:]
+            gate.clamp_(max=gemm1_clamp_limit)
+            up.clamp_(min=-gemm1_clamp_limit, max=gemm1_clamp_limit)
+
+        fused_moe_activation(act_output, gemm1_output, activation, valid_tokens)
 
     ########### gemm2 ##################
     input_A = act_output.contiguous()

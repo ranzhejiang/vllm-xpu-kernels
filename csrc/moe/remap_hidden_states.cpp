@@ -136,6 +136,10 @@ class RemapHiddenStates {
       int* expert_map,
       int* unpermuted_row_to_permuted_row,
       int* rows_per_expert,
+      int64_t* valid_tokens,
+      int* active_expert_ids,
+      int* active_row_offsets,
+      int* active_expert_count,
       void* topk_ids,
       bool is_topk_ids_int32,
       const int num_rows,
@@ -151,6 +155,10 @@ class RemapHiddenStates {
         expert_map(expert_map),
         unpermuted_row_to_permuted_row(unpermuted_row_to_permuted_row),
         rows_per_expert(rows_per_expert),
+        valid_tokens(valid_tokens),
+        active_expert_ids(active_expert_ids),
+        active_row_offsets(active_row_offsets),
+        active_expert_count(active_expert_count),
         topk_ids(topk_ids),
         is_topk_ids_int32(is_topk_ids_int32),
         num_rows(num_rows),
@@ -199,6 +207,30 @@ class RemapHiddenStates {
         expert_cumsum_ptr + local_experts_num,
         expert_cumsum_ptr,
         sycl::plus<int>{});
+
+    if (valid_tokens != nullptr && local_experts_num > 0 && group_id == 0 &&
+        local_id == 0) {
+      int64_t total_valid_rows = expert_cumsum_ptr[local_experts_num - 1];
+      total_valid_rows += rows_per_expert[local_experts_num - 1];
+      valid_tokens[0] = total_valid_rows;
+    }
+
+    if (active_expert_count != nullptr && group_id == 0 && local_id == 0) {
+      int active_count = 0;
+      for (int i = 0; i < local_experts_num; ++i) {
+        if (rows_per_expert[i] <= 0) {
+          continue;
+        }
+        if (active_expert_ids != nullptr) {
+          active_expert_ids[active_count] = i;
+        }
+        if (active_row_offsets != nullptr) {
+          active_row_offsets[active_count] = expert_cumsum_ptr[i];
+        }
+        ++active_count;
+      }
+      active_expert_count[0] = active_count;
+    }
 
     int row = group_id;
     int global_expert_id[TopK];
@@ -335,6 +367,10 @@ class RemapHiddenStates {
   int* expert_map;
   int* unpermuted_row_to_permuted_row;
   int* rows_per_expert;
+  int64_t* valid_tokens;
+  int* active_expert_ids;
+  int* active_row_offsets;
+  int* active_expert_count;
   void* topk_ids;
   bool is_topk_ids_int32;
   const int num_rows;
@@ -353,6 +389,10 @@ void RemapHiddenStatesLauncher(
     int* expert_map,
     int* rows_per_expert,
     int* unpermuted_row_to_permuted_row,
+    int64_t* valid_tokens,
+  int* active_expert_ids,
+  int* active_row_offsets,
+  int* active_expert_count,
     void* topk_ids,
     bool is_topk_ids_int32,
     const int num_rows,
@@ -399,6 +439,10 @@ void RemapHiddenStatesLauncher(
             expert_map,
             unpermuted_row_to_permuted_row,
             rows_per_expert,
+            valid_tokens,
+            active_expert_ids,
+            active_row_offsets,
+            active_expert_count,
             topk_ids,
             is_topk_ids_int32,
             num_rows,
@@ -426,7 +470,11 @@ void remap_hidden_states(
     torch::Tensor& unpermuted_row_to_permuted_row,   // [num_rows, TopK]
     torch::Tensor& topk_ids,                         // [num_rows, TopK]
     int64_t total_experts_num,
-    int64_t local_experts_num) {
+    int64_t local_experts_num,
+    const c10::optional<torch::Tensor>& valid_tokens,
+    const c10::optional<torch::Tensor>& active_expert_ids,
+    const c10::optional<torch::Tensor>& active_row_offsets,
+    const c10::optional<torch::Tensor>& active_expert_count) {
   // dtype check
   TORCH_CHECK(
       hidden_states.scalar_type() == remapped_hidden_states.scalar_type(),
@@ -451,6 +499,32 @@ void remap_hidden_states(
   TORCH_CHECK(
       rows_per_expert.scalar_type() == torch::kInt32,
       "rows_per_expert must be int32");
+
+  if (valid_tokens.has_value()) {
+    TORCH_CHECK(
+        valid_tokens->scalar_type() == torch::kInt64,
+        "valid_tokens must be int64");
+    TORCH_CHECK(valid_tokens->numel() == 1, "valid_tokens must contain 1 element");
+  }
+
+  if (active_expert_ids.has_value()) {
+    TORCH_CHECK(
+        active_expert_ids->scalar_type() == torch::kInt32,
+        "active_expert_ids must be int32");
+  }
+  if (active_row_offsets.has_value()) {
+    TORCH_CHECK(
+        active_row_offsets->scalar_type() == torch::kInt32,
+        "active_row_offsets must be int32");
+  }
+  if (active_expert_count.has_value()) {
+    TORCH_CHECK(
+        active_expert_count->scalar_type() == torch::kInt32,
+        "active_expert_count must be int32");
+    TORCH_CHECK(
+        active_expert_count->numel() == 1,
+        "active_expert_count must contain 1 element");
+  }
 
   TORCH_CHECK(
       topk_ids.scalar_type() == torch::kInt64 ||
@@ -485,9 +559,25 @@ void remap_hidden_states(
   TORCH_CHECK(
       rows_per_expert.size(0) == local_experts_num,
       "rows_per_expert must be [local_experts_num]");
+  TORCH_CHECK(local_experts_num > 0, "local_experts_num must be > 0");
+    if (active_expert_ids.has_value()) {
+    TORCH_CHECK(
+      active_expert_ids->size(0) == local_experts_num,
+      "active_expert_ids must be [local_experts_num]");
+    }
+    if (active_row_offsets.has_value()) {
+    TORCH_CHECK(
+      active_row_offsets->size(0) == local_experts_num,
+      "active_row_offsets must be [local_experts_num]");
+    }
   TORCH_CHECK(
       topk_ids.size(0) == num_rows && topk_ids.size(1) == TopK,
       "topk_ids must be [num_rows, TopK]");
+
+    TORCH_CHECK(
+      active_expert_ids.has_value() == active_row_offsets.has_value() &&
+        active_row_offsets.has_value() == active_expert_count.has_value(),
+      "active expert metadata tensors must be provided together");
 
   const at::DeviceGuard device_guard(hidden_states.device());
   auto& queue = vllm::xpu::vllmGetQueue();
@@ -506,6 +596,18 @@ void remap_hidden_states(
                              : nullptr,                                       \
       reinterpret_cast<int*>(rows_per_expert.data_ptr()),                     \
       reinterpret_cast<int*>(unpermuted_row_to_permuted_row.data_ptr()),      \
+        valid_tokens.has_value()                                                \
+          ? reinterpret_cast<int64_t*>(valid_tokens->data_ptr())              \
+          : nullptr,                                                          \
+        active_expert_ids.has_value()                                           \
+          ? reinterpret_cast<int*>(active_expert_ids->data_ptr())             \
+          : nullptr,                                                          \
+        active_row_offsets.has_value()                                          \
+          ? reinterpret_cast<int*>(active_row_offsets->data_ptr())            \
+          : nullptr,                                                          \
+        active_expert_count.has_value()                                         \
+          ? reinterpret_cast<int*>(active_expert_count->data_ptr())           \
+          : nullptr,                                                          \
       reinterpret_cast<void*>(topk_ids.data_ptr()),                           \
       topk_ids.scalar_type() == torch::kInt32,                                \
       num_rows,                                                               \

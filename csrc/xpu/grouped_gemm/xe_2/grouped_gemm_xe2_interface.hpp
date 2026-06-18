@@ -208,7 +208,11 @@ at::Tensor cutlass_grouped_gemm_xe2_impl(
   int D_total_M = ptr_D.size(0);
   int D_N = ptr_D.size(1);
   int group_size = -1;
-  int A_avg_M = A_total_M / num_experts;
+
+  if (A_total_M == 0) {
+    return ptr_D;
+  }
+  int A_avg_M = A_total_M / std::max<int64_t>(num_experts, 1);
 
   TORCH_CHECK(B_E == num_experts, "ptr_B.size(0) must match num_experts");
   TORCH_CHECK(A_total_M == D_total_M, "ptr_A.size(0) must match ptr_D.size(0)");
@@ -348,9 +352,12 @@ at::Tensor cutlass_grouped_gemm_xe2_impl(
   }
 
     if (A_avg_M <= 8) {
-      using policy = w16a16_policy_m_16;
+      using policy = w16a16_policy_m_8;
       W16A16LauncherCallER(policy);
     } else if (A_avg_M <= 16) {
+      using policy = w16a16_policy_m_16;
+      W16A16LauncherCallER(policy);
+    } else if (A_avg_M <= 32) {
       using policy = w16a16_policy_m_32;
       W16A16LauncherCallER(policy);
     } else {

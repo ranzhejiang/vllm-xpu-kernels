@@ -186,9 +186,16 @@ def test_remap_hidden_states(num_rows, hidden_size, total_experts_num, topk,
                             total_experts_num, local_experts_num)
 
     torch.ops._moe_C.remap_hidden_states(
-        hidden_states, scales, remapped_hidden_states, remapped_scales,
-        expert_map, rows_per_expert, unpermuted_row_to_permuted_row,
-        topk_ids, total_experts_num, local_experts_num)
+        hidden_states=hidden_states,
+        hidden_states_scales=scales,
+        remapped_hidden_states=remapped_hidden_states,
+        remapped_hidden_states_scales=remapped_scales,
+        expert_map=expert_map,
+        rows_per_expert=rows_per_expert,
+        unpermuted_row_to_permuted_row=unpermuted_row_to_permuted_row,
+        topk_ids=topk_ids,
+        total_experts_num=total_experts_num,
+        local_experts_num=local_experts_num)
 
     if data_dtype is torch.float4_e2m1fn_x2:
         remapped_hidden_states = remapped_hidden_states.view(torch.uint8)
@@ -316,9 +323,16 @@ def test_remap_hidden_states_overflow(num_rows, hidden_size, total_experts_num,
     topk_ids = topk_ids.to(torch.int32)
 
     torch.ops._moe_C.remap_hidden_states(
-        hidden_states, scales, remapped_hidden_states, remapped_scales,
-        expert_map, rows_per_expert, unpermuted_row_to_permuted_row,
-        topk_ids, total_experts_num, local_experts_num)
+        hidden_states=hidden_states,
+        hidden_states_scales=scales,
+        remapped_hidden_states=remapped_hidden_states,
+        remapped_hidden_states_scales=remapped_scales,
+        expert_map=expert_map,
+        rows_per_expert=rows_per_expert,
+        unpermuted_row_to_permuted_row=unpermuted_row_to_permuted_row,
+        topk_ids=topk_ids,
+        total_experts_num=total_experts_num,
+        local_experts_num=local_experts_num)
 
     print("remapped_hidden_states", remapped_hidden_states, flush=True)
     print("remapped_scales", remapped_scales, flush=True)

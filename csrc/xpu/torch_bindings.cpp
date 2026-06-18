@@ -51,6 +51,17 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, xpu_ops) {
       "cutlass_grouped_gemm_interface",
       torch::kXPU,
       &cutlass_grouped_gemm_interface);
+
+  xpu_ops.def(
+      "cutlass_moe_fc1_silu_interface(Tensor ptr_A, Tensor ptr_B, Tensor? "
+      "ptr_bias, Tensor ptr_D, Tensor rows_per_expert, int inter_size, "
+      "int K, int num_experts, Tensor? active_expert_ids=None, Tensor? "
+      "active_row_offsets=None, Tensor? active_expert_count=None, float "
+      "clamp_limit=0.0) -> Tensor");
+  xpu_ops.impl(
+      "cutlass_moe_fc1_silu_interface",
+      torch::kXPU,
+      &cutlass_moe_fc1_silu_interface);
 #endif
 
   xpu_ops.def(

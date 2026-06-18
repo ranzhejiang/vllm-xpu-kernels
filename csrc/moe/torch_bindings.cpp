@@ -101,9 +101,11 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, m) {
       "Tensor remapped_hidden_states,"
       "Tensor? remapped_hidden_states_scales,"
       "Tensor? expert_map, Tensor rows_per_expert,"
-      "Tensor unpermuted_row_to_permuted_row, Tensor topk_ids,"
-      "int total_experts_num, int "
-      "local_experts_num) -> "
+      "Tensor unpermuted_row_to_permuted_row, "
+      "Tensor topk_ids,"
+      "int total_experts_num, int local_experts_num, "
+      "Tensor? valid_tokens=None, Tensor? active_expert_ids=None, "
+      "Tensor? active_row_offsets=None, Tensor? active_expert_count=None) -> "
       "()");
   m.impl("remap_hidden_states", torch::kXPU, &remap_hidden_states);
 }
