@@ -165,6 +165,16 @@ def quant_fp8_block_act(x: torch.Tensor):
         )
     return x_q, x_s
 
+def quant_fp8_act_xpu(x: torch.Tensor, scale: torch.Tensor | None = None):
+    x_q = torch.empty_like(x, device=x.device, dtype=torch.float8_e4m3fn)
+    if scale is None:
+        x_s = torch.empty((1,), device=x.device, dtype=torch.float32)
+        torch.ops._C.dynamic_scaled_fp8_quant(x_q, x, x_s)
+    else:
+        x_s = scale
+        torch.ops._C.static_scaled_fp8_quant(x_q, x, x_s, None)
+    return x_q, x_s
+
 def _as_e8m0(s):
         """Reinterpret uint8 scale bits as float8_e8m0fnu for correct
         conversion to float32 (2^(e-127)).  float8_e8m0fnu tensors are
@@ -402,10 +412,12 @@ def ref_fused_moe(recipe,
                                 num_experts)
     return output
 
-def quant_act_xpu(x, recipe):
+def quant_act_xpu(x, recipe, scale=None):
     if recipe in ("mxfp4", "mxfp8"):
         return quant_mxfp_act_xpu(x, recipe)
     elif recipe == "fp8block":
         return quant_fp8_block_act(x)
+    elif recipe == "fp8":
+        return quant_fp8_act_xpu(x, scale)
     else:
         raise NotImplementedError(f"Unsupported recipe for quant_act_xpu: {recipe}") # noqa: E501

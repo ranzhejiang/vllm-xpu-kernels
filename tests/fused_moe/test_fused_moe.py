@@ -150,6 +150,80 @@ def ref_fused_moe(x,
     return expert_cache
 
 
+def _make_fp8_fused_moe_for_route_test(
+    num_experts=2,
+    hidden_size=8,
+    intermediate_size=4,
+):
+    w13 = torch.randn(
+        (num_experts, hidden_size, 2 * intermediate_size),
+        device=DEVICE,
+        dtype=torch.bfloat16,
+    ).to(torch.float8_e4m3fn)
+    w2 = torch.randn(
+        (num_experts, intermediate_size, hidden_size),
+        device=DEVICE,
+        dtype=torch.bfloat16,
+    ).to(torch.float8_e4m3fn)
+    scales = torch.ones((num_experts,), device=DEVICE, dtype=torch.float32)
+    return XpuFusedMoe(
+        w13=w13.contiguous(),
+        w13_scales=scales,
+        w13_bias=None,
+        w2=w2.contiguous(),
+        w2_scales=scales,
+        w2_bias=None,
+        n_experts_per_token=1,
+        activation="silu",
+        num_experts=num_experts,
+    )
+
+
+@pytest.mark.parametrize("provide_a2_scale", [True, False])
+def test_fused_moe_fp8_apply_forwards_scales_to_kernel(
+    monkeypatch,
+    provide_a2_scale,
+):
+    fused_moe_impl = _make_fp8_fused_moe_for_route_test()
+    fused_moe_impl._use_ref = False
+
+    hidden_states = torch.randn((2, 8), device=DEVICE, dtype=torch.bfloat16)
+    output = torch.empty_like(hidden_states)
+    topk_weights = torch.randn((2, 1), device=DEVICE, dtype=torch.float32)
+    topk_ids = torch.zeros((2, 1), device=DEVICE, dtype=torch.int64)
+    a1q_scale = torch.ones((2, 1), device=DEVICE, dtype=torch.float32)
+    a2_scale = (
+        torch.ones((1,), device=DEVICE, dtype=torch.float32)
+        if provide_a2_scale
+        else None
+    )
+
+    captured_args = {}
+    monkeypatch.setattr(
+        fused_moe_impl,
+        "_apply_ref",
+        lambda *args, **kwargs: pytest.fail("_apply_ref should not be called"),
+    )
+
+    def _capture_apply_kernel(*args, **kwargs):
+        captured_args["a1q_scale"] = args[5]
+        captured_args["a2_scale"] = args[6]
+
+    monkeypatch.setattr(fused_moe_impl, "_apply_kernel", _capture_apply_kernel)
+
+    fused_moe_impl.apply(
+        output=output,
+        hidden_states=hidden_states,
+        topk_weights=topk_weights,
+        topk_ids=topk_ids,
+        a1q_scale=a1q_scale,
+        a2_scale=a2_scale,
+    )
+
+    assert captured_args["a1q_scale"] is a1q_scale
+    assert captured_args["a2_scale"] is a2_scale
+
+
 @pytest.mark.parametrize("m,n,k", FUSED_MOE_MNK_FACTORS)
 @pytest.mark.parametrize("e", NUM_EXPERTS)
 @pytest.mark.parametrize("topk", TOP_KS)

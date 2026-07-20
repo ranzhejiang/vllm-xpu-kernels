@@ -6,6 +6,7 @@ import torch
 
 try:
     from . import _C  # noqa: F401
+    from . import _moe_C  # noqa: F401
     from . import _xpu_C  # noqa: F401
     FUSEDMOE_UNAVAILABLE_REASON = None
     FUSEDMOE_AVAILABLE = True
@@ -122,7 +123,6 @@ def fused_moe_activation(act_output, gemm1_output, activation):
         torch.ops._C.swiglustep_and_mul(act_output, gemm1_output, 7.0)
     else:
         raise ValueError(f"Unsupported FusedMoe activation: {activation}.")
-
 def implement_zp(qweight):
     # change u4 to s4 to avoid zero point in gemm kernel
     # only support default zero point now
@@ -272,6 +272,7 @@ class XpuFusedMoe:
         topk_ids,
         expert_map=None,
         a1q_scale=None,
+        a2_scale=None,
     ):
         if self._use_ref:
             self._apply_ref(output, hidden_states,
@@ -280,7 +281,7 @@ class XpuFusedMoe:
         else:
             self._apply_kernel(output, hidden_states,
                                topk_weights, topk_ids,
-                               expert_map, a1q_scale)
+                               expert_map, a1q_scale, a2_scale)
 
     def _apply_ref(
         self,
@@ -318,6 +319,7 @@ class XpuFusedMoe:
         topk_ids,
         expert_map=None,
         a1q_scale=None,
+        a2_scale=None,
     ):
         num_rows, hidden_size = hidden_states.shape
         num_moe_inputs = self.n_experts_per_token * num_rows
@@ -393,7 +395,10 @@ class XpuFusedMoe:
                                 device=output.device)
 
         if act_quant:
-            act_output, gemm2_act_scale = quant_act_xpu(act_output, self.recipe)
+            act_output, gemm2_act_scale = quant_act_xpu(act_output,
+                                                        self.recipe,
+                                                        a2_scale)
+
         torch.ops._xpu_C.cutlass_grouped_gemm_interface(
             ptr_A=act_output,
             ptr_A_scale=gemm2_act_scale if act_quant else None,
